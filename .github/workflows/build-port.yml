@@ -57,27 +57,32 @@ jobs:
           channel: stable
           cache: true
 
-      - name: 安装工具与 NDK（尽力而为，失败只告警）
+      - name: 安装工具与 NDK 28.2
         run: |
+          exec > >(tee -a /tmp/ci.log) 2>&1
           set -x
-          echo "ANDROID_HOME=$ANDROID_HOME ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
           sudo apt-get update -qq || true
           sudo apt-get install -y -qq zstd file gpgv xz-utils || true
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "SDK=$SDK"
-          ls "$SDK" 2>/dev/null | head
-          ls "$SDK/ndk" 2>/dev/null || echo "no ndk dir yet"
-          if ! ls -d "$SDK"/ndk/* >/dev/null 2>&1; then
-            ( yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" --licenses >/dev/null 2>&1 ) || true
-            ( yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "ndk;28.2.13676358" 2>&1 | tail -20 ) || echo "::warning::NDK 安装失败，交给 Gradle 自己解决"
+          ls "$SDK" || true
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SM" ] || SM="$(command -v sdkmanager)"
+          echo "sdkmanager=$SM"
+          "$SM" --version || true
+          if [ -f "$SDK/ndk/28.2.13676358/source.properties" ]; then
+            echo "NDK 28.2 已存在"
+          else
+            ( yes | "$SM" --sdk_root="$SDK" "ndk;28.2.13676358" ) || true
           fi
-          NDK_DIR=$(ls -d "$SDK"/ndk/* 2>/dev/null | head -1)
-          echo "NDK_DIR=$NDK_DIR"
-          if [ -n "$NDK_DIR" ]; then
-            echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
-            echo "ANDROID_NDK_ROOT=$NDK_DIR" >> $GITHUB_ENV
+          ls "$SDK/ndk" || true
+          if [ ! -f "$SDK/ndk/28.2.13676358/source.properties" ]; then
+            echo "::error::NDK 28.2.13676358 安装失败（tawcroot 需要它）"
+            exit 1
           fi
-          true
+          echo "ANDROID_NDK_HOME=$SDK/ndk/28.2.13676358" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$SDK/ndk/28.2.13676358" >> $GITHUB_ENV
+          echo "NDK 就绪：$SDK/ndk/28.2.13676358"
 
       - name: 写入签名配置
         env:

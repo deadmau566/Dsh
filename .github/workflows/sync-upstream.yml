@@ -1,0 +1,210 @@
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: '0 1 * * *' # 每天 09:00 北京
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git remote add upstream https://github.com/ccch1mneyyy/dsh-go.git 2>/dev/null || git remote set-url upstream https://github.com/ccch1mneyyy/dsh-go.git
+          git fetch upstream main
+          LATEST=$(gh api repos/ccch1mneyyy/dsh-go/releases/latest --jq '.tag_name // empty' 2>/dev/null || true)
+          if [ -n "$LATEST" ] && ! git rev-parse -q --verify "refs/tags/$LATEST^{commit}" >/dev/null 2>&1; then
+            git fetch upstream "refs/tags/$LATEST:refs/tags/$LATEST" || true
+          fi
+
+      - name: Upstream released a new version?
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh api repos/ccch1mneyyy/dsh-go/releases/latest --jq '.tag_name // empty' 2>/dev/null || true)
+          FALLBACK=0
+          if [ -n "$LATEST" ]; then
+            COMMIT=$(git rev-parse -q --verify "refs/tags/$LATEST^{commit}" || true)
+            if [ -z "$COMMIT" ]; then
+              echo "release $LATEST 的 tag 没抓到，退回两天检查规则"
+              FALLBACK=1
+            elif git merge-base --is-ancestor "$COMMIT" HEAD; then
+              echo "已经同步过上游 $LATEST，不动"
+              echo "behind=false" >> $GITHUB_OUTPUT
+              exit 0
+            elif git merge-base --is-ancestor "$COMMIT" upstream/main; then
+              echo "上游发布了新版本 $LATEST，开始同步"
+              echo "behind=true" >> $GITHUB_OUTPUT
+              echo "ref=$COMMIT" >> $GITHUB_OUTPUT
+              echo "tag=$LATEST" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "最新 release $LATEST 的代码不在上游 main 里，本次停止同步"
+              echo "behind=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          else
+            echo "上游还没有正式 release，退回两天检查规则"
+            FALLBACK=1
+          fi
+          if [ "$FALLBACK" = "1" ]; then
+            if ! git merge-base --is-ancestor upstream/main HEAD; then
+              echo "上游 main 有新提交（$(git rev-list --count HEAD..upstream/main) 个），同步"
+              echo "behind=true" >> $GITHUB_OUTPUT
+              echo "ref=$(git rev-parse upstream/main)" >> $GITHUB_OUTPUT
+              echo "tag=main@$(git rev-parse --short upstream/main)" >> $GITHUB_OUTPUT
+            else
+              echo "上游没有更新"
+              echo "behind=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.check.outputs.behind == 'true'
+        continue-on-error: true
+        run: |
+          git config user.name "dsh-go-sync"
+          git config user.email "sync@dsh-go.local"
+
+          # 我们改过的文件：冲突时一律保留我们的版本
+          OURS="README.md \
+            app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneCore.kt \
+            app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneControl.kt \
+            app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneGuest.kt \
+            app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhonePlugin.kt \
+            app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneToolCatalog.kt \
+            app/lib/phone/phone_channel.dart \
+            app/lib/state/phone_state.dart \
+            app/lib/ui/chat/chat_screen.dart \
+            app/lib/ui/chat/dock/chat_dock.dart \
+            app/lib/ui/chat/dock/root_pill.dart \
+            app/lib/ui/features/permission_page.dart \
+            app/lib/state/chat_pills_state.dart \
+            app/lib/state/session_pill_state.dart \
+            app/lib/ui/phone/shell_permissions_page.dart \
+            app/lib/ui/plugins/native/composer_capsules.dart \
+            app/lib/ui/plugins/plugin_detail_sheet.dart \
+            app/lib/ui/plugins/plugin_inventory_page.dart \
+            app/lib/ui/settings/settings_screen.dart \
+            app/lib/update/update_config.dart"
+
+          BASE=$(git merge-base HEAD "${{ steps.check.outputs.ref }}")
+          TOUCHED=$(git diff --name-only "$BASE" "${{ steps.check.outputs.ref }}" -- $OURS | tr '\n' ' ')
+
+          # 冲突也不再 abort：按名单逐个决定留谁
+          git merge --no-ff --no-commit "${{ steps.check.outputs.ref }}" || true
+
+          # 1) 我们的文件 + .github 全部用我们的
+          for f in $OURS .github; do
+            git checkout HEAD -- "$f" 2>/dev/null || true
+          done
+          # 1b) 上游新加的 .github 文件（HEAD 里没有的）必须删掉：
+          #     GITHUB_TOKEN（GitHub App）没有 workflows 权限，带新 workflow 文件 push 会被拒。
+          git ls-tree -r --name-only HEAD -- .github > /tmp/ours_gh.txt
+          git diff --name-only --diff-filter=A HEAD -- .github | while read -r f; do
+            grep -qxF "$f" /tmp/ours_gh.txt || { echo "drop upstream-only workflow: $f"; git rm -q -f -- "$f" 2>/dev/null || rm -f "$f"; }
+          done
+
+          # 2) pubspec 整份用上游的（依赖、SDK、版本号都跟上游走）
+          git show "${{ steps.check.outputs.ref }}:app/pubspec.yaml" > app/pubspec.yaml
+
+          # 3) 名单外的冲突文件一律用上游
+          git diff --name-only --diff-filter=U | while read -r f; do
+            if git ls-files -u -- "$f" | grep -q "stage 3"; then
+              git checkout --theirs -- "$f" 2>/dev/null || true
+            else
+              # modify/delete：上游删了文件，--theirs 没有内容，直接删
+              git rm -q -f -- "$f" 2>/dev/null || rm -f "$f"
+            fi
+          done
+
+          git add -A
+          git commit -m "sync: 同步上游 ${{ steps.check.outputs.tag }} [skip ci]" \
+            -m "上游动过、但按规则保留我们的文件：${TOUCHED:-无}"
+          echo "TOUCHED=$TOUCHED" >> $GITHUB_OUTPUT
+
+      - name: Check fork features
+        if: steps.check.outputs.behind == 'true' && steps.merge.outcome == 'success'
+        run: bash scripts/check-fork-symbols.sh
+
+      - name: Open issue on conflict
+        if: steps.merge.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create --repo ghjicb/dsh-Go \
+            --title "同步上游冲突：$(date -u +%F)" \
+            --body "上游 $(git rev-parse --short upstream/main) 和我们改过的文件冲突，自动合并失败。工作流 run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}。需要人看一下再合并。" || true
+
+      - name: Push main
+        if: steps.check.outputs.behind == 'true' && steps.merge.outcome == 'success'
+        run: |
+          # 合并 commit 已在 Merge upstream 步骤里创建。
+          # 同步期间 main 可能被别人推过（手动修复）：先追上再推，否则 push 被拒白跑一次。
+          git fetch origin main
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            echo "main 在我们同步期间前进了，先合上再推"
+            git -c user.name="dsh-go-sync" -c user.email="sync@dsh-go.local" \
+              merge --no-edit origin/main || {
+                # 撞车只可能发生在我们也动过的文件上：一律用 origin/main 上最新的那份
+                git checkout --theirs -- . 2>/dev/null || true
+                git add -A
+                git commit --no-edit || true
+              }
+          fi
+          git push origin HEAD:main
+
+      - name: Close stale sync failure issues
+        if: steps.check.outputs.behind == 'true' && steps.merge.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for n in $(gh issue list --repo ghjicb/dsh-Go --search "自动同步失败 in:title" --state open --json number -q '.[].number' 2>/dev/null); do
+            gh issue close "$n" --repo ghjicb/dsh-Go --comment "本次自动同步已成功" || true
+          done
+
+      - name: Trigger release build
+        if: steps.check.outputs.behind == 'true' && steps.merge.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build-apk.yml --repo ghjicb/dsh-Go --ref main -f release=true
+
+      - name: Report sync failure
+        # 合并冲突已经单独开 issue；这里只报 fetch/检查/断言这类失败
+        if: failure() && steps.merge.outcome != 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create --repo ghjicb/dsh-Go \
+            --title "自动同步失败：$(date -u +%F)" \
+            --body "同步过程失败（不是合并冲突）。run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+
+      - name: Note files upstream touched
+        if: steps.check.outputs.behind == 'true' && steps.merge.outputs.TOUCHED != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create --repo ghjicb/dsh-Go \
+            --title "上游动过我们改的文件：$(date -u +%F)" \
+            --body "这次同步上游改到了下面这些文件，按规则保留了我们的版本，上游的改动没有自动进来，需要的话人工合并：
+          `${{ steps.merge.outputs.TOUCHED }}`
+          run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true

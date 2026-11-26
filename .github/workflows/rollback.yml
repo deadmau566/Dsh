@@ -1,0 +1,37 @@
+name: rollback
+
+# 手动回滚：把旧 commit 建成 rollback/<sha> 分支，用它重新构建并覆盖 release 资产。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要回滚到的 commit（例如 d14c3dc6）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  rollback:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Create rollback branch at old commit
+        run: |
+          git config user.name "dsh-go-rollback"
+          git config user.email "rollback@dsh-go.local"
+          git branch -f "rollback/${{ inputs.ref }}" "${{ inputs.ref }}"
+          git push -f origin "rollback/${{ inputs.ref }}"
+
+      - name: Dispatch release build on that ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run build-apk.yml --repo "${{ github.repository }}" \
+            --ref "rollback/${{ inputs.ref }}" -f release=true
+          echo "已用 ${{ inputs.ref }} 触发发版构建；它会覆盖同版本 release 资产。"

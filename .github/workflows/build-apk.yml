@@ -1,0 +1,431 @@
+name: build-apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: '构建成功后自动发 GitHub release（同步上游用）'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  # 发版构建单独排队，不能被普通 push 取消（取消了这次发版就没了）
+  group: build-apk-${{ github.ref }}-${{ github.event.inputs.release == 'true' && 'release' || 'push' }}
+  cancel-in-progress: ${{ github.event.inputs.release != 'true' }}
+
+jobs:
+  apk:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 50
+          fetch-tags: true
+
+      - name: Cache flutter pub
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('app/pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Cache gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('app/android/**/*.gradle*', 'app/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Cache NDK 28.2
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/ndk/28.2.13676358
+          key: ndk-28.2.13676358-${{ runner.os }}
+
+      - name: Apply shell tool patch (optional)
+        run: |
+          if [ -f 0001-add-shell-tool.patch ] && git apply --check 0001-add-shell-tool.patch 2>/dev/null; then
+            git apply --verbose 0001-add-shell-tool.patch
+          else
+            echo "no patch to apply (change is already in the tree)"
+          fi
+
+      - name: Check fork features intact
+        run: bash scripts/check-fork-symbols.sh
+
+      - name: Cache JDK 17 (temurin)
+        uses: actions/cache@v4
+        with:
+          path: /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk
+          key: jdk-temurin-17
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Write release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::warning::RELEASE_KEYSTORE_B64 not set (fork without secrets?) - building with debug signing"
+            exit 0
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > app/android/app/release.keystore
+          cat > app/android/key.properties <<KEYEOF
+          storeFile=$PWD/app/android/app/release.keystore
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          KEYEOF
+          test -s app/android/app/release.keystore
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.7'
+          channel: stable
+          cache: true
+
+      - name: Dart analyze (fast pre-check)
+        working-directory: app
+        run: |
+          flutter pub get
+          dart analyze --no-fatal-warnings lib 2>&1 | tail -40
+
+      - name: Accept Android licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-zstd-file-gpgv
+
+      - name: Install toolchain deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd file gpgv
+
+      - name: Install NDK 28.2 (tawcroot)
+        run: |
+          if [ -f "$ANDROID_HOME/ndk/28.2.13676358/source.properties" ]; then
+            echo "NDK 28.2 already present (cache hit)"
+          else
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;28.2.13676358" > /dev/null
+          fi
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> $GITHUB_ENV
+          test -f "$ANDROID_HOME/ndk/28.2.13676358/source.properties"
+
+      - name: Restore runtime inputs
+        uses: actions/cache/restore@v4
+        with:
+          path: runtime/.cache
+          key: runtime-${{ runner.os }}-ubuntu-24.04.5
+          restore-keys: |
+            runtime-${{ runner.os }}-
+
+      - name: Patch runtime mirrors (fallback)
+        # 上游 runtime 脚本把 Ubuntu base 镜像写死成清华；那边 403 时整个构建挂掉。
+        # 运行时改成「可覆盖 + 官方 cdimage 兜底」，不动上游文件本体（避免同步时被覆盖）。
+        run: |
+          set -euo pipefail
+          f=runtime/build-runtime.sh
+          sed -i 's|^UBUNTU_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release"|UBUNTU_MIRROR="${UBUNTU_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release}"|' "$f"
+          sed -i 's|  fetch "$UBUNTU_MIRROR/$name" "$dir/$name" "$pin"|  fetch "$UBUNTU_MIRROR/$name" "$dir/$name" "$pin" "${UBUNTU_FALLBACK:-https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release}/$name"|' "$f"
+          grep -q 'UBUNTU_MIRROR:-' "$f"
+          grep -q 'UBUNTU_FALLBACK' "$f"
+          echo "runtime mirrors patched"
+
+      - name: Build runtime (arm64-v8a)
+        env:
+          UBUNTU_MIRROR: https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release
+          UBUNTU_FALLBACK: https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release
+        run: bash runtime/build-runtime.sh arm64-v8a
+
+      - name: Save runtime inputs
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: runtime/.cache
+          key: runtime-${{ runner.os }}-ubuntu-24.04.5
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -o pipefail
+          DSH_BETA_TOKEN_FILE= bash tooling/build-apk.sh -f arm64 --no-companion 2>&1 | tee /tmp/build.log
+
+      - name: Upload build log
+        if: failure() && !cancelled()
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: build-log
+          path: /tmp/build.log
+          retention-days: 3
+
+      - name: Show artifacts
+        run: find app/build/app/outputs -name '*.apk' -exec ls -lh {} \;
+
+      - name: Verify APK signature
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+        run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | tail -1)
+          [ -n "$APKSIGNER" ] || { echo "apksigner not found, skipping"; exit 0; }
+          "$APKSIGNER" verify --print-certs app/build/app/outputs/flutter-apk/*.apk > /tmp/certs.txt
+          head -6 /tmp/certs.txt
+          # 配了私签 secret 时，指纹必须和我们 keystore 一致，否则拒绝发版
+          if [ -n "$KEYSTORE_B64" ]; then
+            grep -qi 'b1c9f6a1527907a0bbeb95b010031bd62ea883635d9b608cf9a04ef6285f7aae' /tmp/certs.txt \
+              || { echo "::error::APK 签名指纹不对（不是我们的私签），拒绝发版"; exit 1; }
+            echo "signature fingerprint OK (our release keystore)"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-go-apk-arm64
+          path: app/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Prepare release assets
+        if: github.event.inputs.release == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(sed -n 's/^version:[[:space:]]*\([^+]*\).*/\1/p' app/pubspec.yaml)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          sed -i 's|REPO = "ccch1mneyyy/dsh-go"|REPO = "ghjicb/dsh-Go"|' tooling/release_assets.py
+          grep -q 'REPO = "ghjicb/dsh-Go"' tooling/release_assets.py
+          UPSTREAM=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/ccch1mneyyy/dsh-go/releases/latest \
+            | jq -r '.tag_name // empty' | sed 's/^[vV]//') || UPSTREAM=""
+          [ -n "$UPSTREAM" ] || UPSTREAM="未知"
+          echo "UPSTREAM=$UPSTREAM" >> $GITHUB_ENV
+          TAG="v$VERSION"
+          PREV_BODY=$(gh release view "$TAG" --json body -q .body 2>/dev/null || true)
+          if [ -n "$PREV_BODY" ]; then
+            N=$(printf '%s' "$PREV_BODY" | sed -n 's/.*第 \([0-9]\+\) 次重建.*/\1/p' | head -1)
+            N=$(( ${N:-0} + 1 ))
+            CHANGES=$(git log --oneline --no-merges -5 | sed 's/^[a-f0-9]\{7,40\} /- /' | tr -d '\r')
+            CHANGELOG="第 $N 次重建（修复 #$N）"
+            [ -n "$CHANGES" ] && CHANGELOG="$CHANGELOG"$'\n'"$CHANGES"
+          else
+            CHANGELOG="同步上游更新，修复部分 bug"
+          fi
+          BUILT_AT=$(date -u +%Y-%m-%dT%H:%MZ)
+          python3 - "$VERSION" "$CHANGELOG" "$UPSTREAM" "$BUILT_AT" <<'PY'
+          import pathlib, sys
+          version, changelog, upstream, built_at = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          t = pathlib.Path('.github/release-notes.md').read_text(encoding='utf-8')
+          t = t.replace('{{VERSION}}', version).replace('{{UPSTREAM_VERSION}}', upstream)
+          t = t.replace('{{CHANGELOG}}', changelog or '- 同步上游')
+          t = t.replace('{{BUILT_AT}}', built_at)
+          pathlib.Path('/tmp/notes.md').write_text(t, encoding='utf-8')
+          PY
+          python3 tooling/release_assets.py --notes /tmp/notes.md --delta-from 0
+          ls -lh dist/
+
+      - name: Publish GitHub release
+        if: github.event.inputs.release == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v$VERSION"
+          if gh release view "$TAG" --repo ghjicb/dsh-Go >/dev/null 2>&1; then
+            # 版本名跟上游，同一版本内的修复也要能被 App 检测到：
+            # 覆盖同 tag 的资产（构建号更大），不改 tag、不跳上游版本。
+            echo "release $TAG 已存在：覆盖资产（构建号更新，App 仍能检测到）"
+            gh release upload "$TAG" dist/* --repo ghjicb/dsh-Go --clobber
+            gh release edit "$TAG" --repo ghjicb/dsh-Go --notes-file /tmp/notes.md
+            exit 0
+          fi
+          gh release create "$TAG" dist/* --repo ghjicb/dsh-Go --title "DSH Go $VERSION" --notes-file /tmp/notes.md
+
+      - name: Auto merge autofix branch (no release)
+        if: success() && startsWith(github.ref, 'refs/heads/autofix/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          git config user.name "dsh-go-autofix"
+          git config user.email "autofix@dsh-go.local"
+          git fetch origin main
+          git checkout -B main origin/main
+          if ! git merge --ff-only "$BRANCH"; then
+            gh issue create --repo "${{ github.repository }}" \
+              --title "自动修复合并失败（main 已前进）：$BRANCH" \
+              --body "修复分支已构建成功，但 main 在构建期间前进了，ff-only 合并失败。需要人看：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+            exit 1
+          fi
+          # 加 [skip ci] 避免再触发一次 push 构建；下面单独触发发版构建
+          git commit --amend -m "$(git log -1 --format=%s) [skip ci]"
+          git push origin main
+          git push origin --delete "$BRANCH" || true
+          # 不自动发版：同版本覆盖会让所有用户反复收到「有更新」提示。
+          # 修复先留在 main，等上游发新版本一起带出去。
+          for n in $(gh issue list --repo "${{ github.repository }}" --search "自动修复没成 in:title" --state open --json number -q '.[].number' 2>/dev/null); do
+            gh issue close "$n" --repo "${{ github.repository }}" --comment "已自动修复并合并到 main（下个上游版本发版时带出）" || true
+          done
+          gh issue create --repo "${{ github.repository }}" \
+            --title "自动修复已合并到 main（未发版）：$(git rev-parse --short HEAD)" \
+            --body "构建已通过，修复已合进 main。等上游发新版本时随发版一起带出。" || true
+
+      - name: Report failure as issue
+        if: failure() && github.event.inputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create --repo ghjicb/dsh-Go \
+            --title "自动同步构建失败：${{ github.sha }}" \
+            --body "工作流 run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}。检查日志后修好，再重跑 sync-upstream。" || true
+
+  autofix:
+    needs: apk
+    if: failure() && !cancelled()
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      issues: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 50
+
+      - name: Work out attempt number
+        id: attempt
+        run: |
+          REF="${GITHUB_REF#refs/heads/}"
+          if [[ "$REF" == autofix/*/* ]]; then
+            ROOT=$(echo "$REF" | cut -d/ -f2)
+            N=$(echo "$REF" | cut -d/ -f3)
+            N=$((N+1))
+          else
+            ROOT="${{ github.run_id }}"
+            N=1
+          fi
+          MODEL="deepseek-ai/DeepSeek-V4-Flash"
+          echo "root=$ROOT" >> $GITHUB_OUTPUT
+          echo "n=$N" >> $GITHUB_OUTPUT
+          echo "model=$MODEL" >> $GITHUB_OUTPUT
+          echo "第 $N 次修复尝试（根 run $ROOT，模型 $MODEL）"
+
+      - name: Give up after 5 attempts
+        if: ${{ fromJSON(steps.attempt.outputs.n) > 5 }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create --repo "${{ github.repository }}" \
+            --title "自动修复连续 5 次仍失败：${{ github.sha }}" \
+            --body "AI 已经尝试修复 5 次（前 2 次 V3、后 3 次换 V4-Flash），构建还是失败，停止自动修复。最后一次 run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}。需要人看。" || true
+          echo "STOP=true" >> $GITHUB_ENV
+
+      - name: Fetch upstream for reference
+        if: env.STOP != 'true'
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/ccch1mneyyy/dsh-go.git 2>/dev/null || true
+          git fetch --depth 1 upstream main:refs/remotes/upstream/main
+
+      - name: Download failed build log
+        if: env.STOP != 'true'
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: build-log
+          path: /tmp/buildlog
+
+      - name: Check build log present
+        if: env.STOP != 'true'
+        run: |
+          if [ -s /tmp/buildlog/build.log ]; then
+            echo "LOG=/tmp/buildlog/build.log" >> $GITHUB_ENV
+            echo "build log: $(stat -c %s /tmp/buildlog/build.log) bytes"
+          else
+            echo "STOP=true" >> $GITHUB_ENV
+            echo "::warning::没有构建日志 artifact，跳过自动修复"
+          fi
+
+      - name: Auto fix with LLM
+        if: env.STOP != 'true'
+        env:
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+          AUTOFIX_MODEL: ${{ steps.attempt.outputs.model }}
+        run: |
+          set -uo pipefail
+          ROOT="${{ github.run_id }}"
+          START=$(cat /tmp/attempt 2>/dev/null || echo 0)
+          n="$START"
+          while [ "$n" -lt 5 ]; do
+            n=$((n+1))
+            MODEL="deepseek-ai/DeepSeek-V4-Flash"   # 默认全用 V4-Flash，不用 V3
+            echo "第 $n 次修复尝试（根 run $ROOT，模型 $MODEL）"
+            git checkout -- . 2>/dev/null || true
+            if AUTOFIX_MODEL="$MODEL" python3 scripts/auto_fix.py "$LOG"; then
+              if [ -n "$(git diff --name-only)" ]; then
+                echo "--- changed files ---"
+                git diff --name-only
+                echo "N=$n" >> $GITHUB_ENV
+                break
+              fi
+            fi
+            echo "第 $n 次没改出东西，继续下一次（上限 5）"
+            sleep 5
+          done
+          if [ -n "$(git diff --name-only)" ]; then
+            echo "AFTER=$(git diff --name-only | wc -l)" >> $GITHUB_ENV
+          else
+            echo "AFTER=0" >> $GITHUB_ENV
+            echo "AUTOFIX_SKIPPED=1" >> $GITHUB_ENV
+          fi
+
+      - name: Push autofix branch
+        if: env.AFTER != '0' && env.STOP != 'true'
+        run: |
+          git config user.name "dsh-go-autofix"
+          git config user.email "autofix@dsh-go.local"
+          BR="autofix/${{ steps.attempt.outputs.root }}/${{ env.N }}"
+          git checkout -b "$BR"
+          git add -A
+          git commit -m "autofix(${{ env.N }}/5): 修复构建错误"
+          git push -f origin "$BR"
+          echo "PUSHED=1" >> $GITHUB_ENV
+
+      - name: Dispatch build on fix branch
+        if: env.PUSHED == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run build-apk.yml --repo "${{ github.repository }}" \
+            --ref "autofix/${{ steps.attempt.outputs.root }}/${{ env.N }}"
+
+      - name: Report autofix
+        # 修成了就不开 issue（避免每轮都堆一条），只在没修成时提醒
+        if: env.STOP != 'true' && env.PUSHED != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create --repo "${{ github.repository }}" \
+            --title "构建失败，自动修复没成：${{ github.sha }}" \
+            --body "日志：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}。需要人看。" || true

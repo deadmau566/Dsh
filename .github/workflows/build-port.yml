@@ -4,6 +4,13 @@ name: build-port-apk
 # 用这里在 GitHub 的 ubuntu-22.04（x86_64）上构建并签名。
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'runtime/**'
+      - 'tooling/**'
+      - '.github/workflows/build-port.yml'
 
 permissions:
   contents: read
@@ -38,8 +45,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${RELEASE_KEYSTORE_B64:-}" ]; then
-            echo "::error::缺少 secret RELEASE_KEYSTORE_B64（用 make-keystore.sh 生成）"
-            exit 1
+            # 没配签名 secret 时不中断：key.properties 不写，Gradle 会退回 debug 签名。
+            # 这样先能拿到 APK；要长期可覆盖安装，再补 RELEASE_KEYSTORE_B64 重跑一次。
+            echo "::warning::未配置 RELEASE_KEYSTORE_B64，本次用 debug 签名（不可用于后续覆盖升级）"
+            exit 0
           fi
           mkdir -p app/android/app
           printf '%s' "$RELEASE_KEYSTORE_B64" | base64 -d > "$PWD/app/android/app/release.keystore"

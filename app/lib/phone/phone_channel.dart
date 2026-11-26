@@ -621,7 +621,6 @@ class PhoneStatus {
       tasks = const [],
       parallelLimit = 1,
       device = const PhoneDevice(),
-      skills = const PhoneSkillStatus(),
       taskInterruption = const PhoneTaskInterruption(),
       shell = const PhoneShellStatus();
 
@@ -706,7 +705,6 @@ class PhoneStatus {
     tasks: tasks,
     parallelLimit: parallelLimit,
     device: device,
-    skills: skills,
     shell: shell ?? this.shell,
     taskInterruption: taskInterruption,
   );

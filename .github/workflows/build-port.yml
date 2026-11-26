@@ -1,7 +1,7 @@
 name: build-port-apk
 
-# 1.4.0 + fork 的 root shell / 三档终端权限，本机 arm64 打不了包，
-# 用这里在 GitHub 的 ubuntu-22.04（x86_64）上构建并签名。
+# 1.4.0 基线 + fork 的 root shell / 三档终端权限。
+# 本机（aarch64）无法运行 x86_64 的 Flutter/aapt2，所以在这里构建并签名。
 on:
   workflow_dispatch:
   push:
@@ -13,7 +13,7 @@ on:
       - '.github/workflows/build-port.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   apk:
@@ -21,6 +21,28 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache pub
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('app/pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
+      - name: Cache gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('app/android/**/*.gradle*', 'app/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Cache NDK 28.2
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/ndk/28.2.13676358
+          key: ndk-28.2.13676358-${{ runner.os }}
 
       - uses: actions/setup-java@v4
         with:
@@ -33,8 +55,20 @@ jobs:
           channel: stable
           cache: true
 
-      - name: 安装 runtime 构建所需工具
-        run: sudo apt-get update && sudo apt-get install -y zstd file gpgv xz-utils
+      - name: 接受 Android 许可
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
+      - name: 安装工具与 NDK 28.2
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd file gpgv xz-utils
+          if [ -f "$ANDROID_HOME/ndk/28.2.13676358/source.properties" ]; then
+            echo "NDK 已存在"
+          else
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;28.2.13676358" > /dev/null
+          fi
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> $GITHUB_ENV
 
       - name: 写入签名配置
         env:
@@ -45,9 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${RELEASE_KEYSTORE_B64:-}" ]; then
-            # 没配签名 secret 时不中断：key.properties 不写，Gradle 会退回 debug 签名。
-            # 这样先能拿到 APK；要长期可覆盖安装，再补 RELEASE_KEYSTORE_B64 重跑一次。
-            echo "::warning::未配置 RELEASE_KEYSTORE_B64，本次用 debug 签名（不可用于后续覆盖升级）"
+            echo "::warning::未配置 RELEASE_KEYSTORE_B64，本次用 debug 签名"
             exit 0
           fi
           mkdir -p app/android/app
@@ -58,17 +90,29 @@ jobs:
             echo "keyAlias=$RELEASE_KEY_ALIAS"
             echo "keyPassword=$RELEASE_KEY_PASSWORD"
           } > app/android/key.properties
-          "$JAVA_HOME/bin/keytool" -list -v -keystore app/android/app/release.keystore \
-            -storepass "$RELEASE_STORE_PASSWORD" | grep -E 'SHA256:|Alias name:' || true
+          test -s app/android/app/release.keystore
 
-      - name: 构建 arm64 Linux runtime
-        run: bash runtime/build-runtime.sh arm64-v8a
+      - name: 依赖与静态分析
+        working-directory: app
+        run: |
+          set -o pipefail
+          flutter pub get 2>&1 | tee /tmp/analyze.log
+          dart analyze --no-fatal-warnings lib 2>&1 | tee -a /tmp/analyze.log | tail -60
+          test ${PIPESTATUS[0]} -eq 0 || (grep -c " error " /tmp/analyze.log || true)
 
-      - name: 校验 runtime 包
+      - name: 构建 arm64 runtime
+        run: |
+          set -o pipefail
+          bash runtime/build-runtime.sh arm64-v8a 2>&1 | tee /tmp/runtime.log | tail -20
+
+      - name: 校验 runtime
         run: python3 -I tooling/check_runtime_bundle.py arm64
 
       - name: 构建 release APK
-        run: bash tooling/build-apk.sh -f arm64 --no-companion
+        shell: bash
+        run: |
+          set -o pipefail
+          DSH_BETA_TOKEN_FILE= bash tooling/build-apk.sh -f arm64 --no-companion 2>&1 | tee /tmp/build.log
 
       - name: 收集产物
         run: |
@@ -84,3 +128,27 @@ jobs:
             out/*.apk
             out/SHA256SUMS
           if-no-files-found: error
+
+      - name: 发布 APK 到 Releases
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "port-${{ github.run_number }}" out/*.apk out/SHA256SUMS \
+            --title "dsh-go port build ${{ github.run_number }}" \
+            --notes "1.4.0 + fork 三档终端权限（awk/sed 已移出进阶默认）" || \
+          gh release upload "port-${{ github.run_number }}" out/*.apk out/SHA256SUMS --clobber
+
+      - name: 失败时发布日志（便于排查）
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "== analyze =="; cat /tmp/analyze.log 2>/dev/null
+            echo; echo "== runtime =="; tail -100 /tmp/runtime.log 2>/dev/null
+            echo; echo "== build =="; tail -300 /tmp/build.log 2>/dev/null
+          } > /tmp/ci.log || true
+          gh release create "ci-log-${{ github.run_number }}" /tmp/ci.log \
+            --title "CI log ${{ github.run_number }}" --notes "构建失败日志" --latest=false || \
+          gh release upload "ci-log-${{ github.run_number }}" /tmp/ci.log --clobber
